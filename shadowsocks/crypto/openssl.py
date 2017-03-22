@@ -132,7 +132,7 @@ class OpenSSLCryptoBase(object):
 
     def clean(self):
         if self._ctx:
-            libcrypto.EVP_CIPHER_CTX_cleanup(self._ctx)
+            ctx_cleanup(self._ctx)
             libcrypto.EVP_CIPHER_CTX_free(self._ctx)
 
 
