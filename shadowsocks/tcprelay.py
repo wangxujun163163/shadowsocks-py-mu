@@ -28,7 +28,7 @@ import logging
 import traceback
 import random
 
-from shadowsocks import encrypt, eventloop, shell, common
+from shadowsocks import cryptor, eventloop, shell, common
 from shadowsocks.common import parse_header, onetimeauth_verify, \
     onetimeauth_gen, ONETIMEAUTH_BYTES, ONETIMEAUTH_CHUNK_BYTES, \
     ONETIMEAUTH_CHUNK_DATA_LEN, ADDRTYPE_AUTH
@@ -93,6 +93,16 @@ WAIT_STATUS_READWRITING = WAIT_STATUS_READING | WAIT_STATUS_WRITING
 
 BUF_SIZE = 32 * 1024
 
+# helper exceptions for TCPRelayHandler
+
+
+class BadSocksHeader(Exception):
+    pass
+
+
+class NoAcceptableMethods(Exception):
+    pass
+
 
 class TCPRelayHandler(object):
 
@@ -110,12 +120,13 @@ class TCPRelayHandler(object):
         # if is_local, this is sslocal
         self._is_local = is_local
         self._stage = STAGE_INIT
-        self._encryptor = encrypt.Encryptor(
-            config['password'], config['method'])
+        self._cryptor = cryptor.Cryptor(config['password'],
+                                        config['method'])
         if 'one_time_auth' in config:
             self._ota_enable = config['one_time_auth']
         else:
             self._ota_enable = False
+        self._ota_enable_session = self._ota_enable
         self._ota_buff_head = b''
         self._ota_buff_data = b''
         self._ota_len = 0
@@ -250,8 +261,13 @@ class TCPRelayHandler(object):
                                      self._data_to_write_to_remote.append)
             else:
                 self._data_to_write_to_remote.append(data)
-        if self._is_local and not self._fastopen_connected and \
-                self._config['fast_open']:
+            return
+        if self._ota_enable_session:
+            data = self._ota_chunk_data_gen(data)
+        data = self._cryptor.encrypt(data)
+        self._data_to_write_to_remote.append(data)
+
+        if self._config['fast_open'] and not self._fastopen_connected:
             # for sslocal and fastopen, we basically wait for data and use
             # sendto to connect
             try:
@@ -478,7 +494,7 @@ class TCPRelayHandler(object):
                 _hash = self._ota_buff_head[ONETIMEAUTH_CHUNK_DATA_LEN:]
                 _data = self._ota_buff_data
                 index = struct.pack('>I', self._ota_chunk_idx)
-                key = self._encryptor.decipher_iv + index
+                key = self._cryptor.decipher_iv + index
                 if onetimeauth_verify(_hash, _data, key) is False:
                     logging.warn('U[%d] TCP One time auth fail, chunk is dropped!' % self._config[
                                  'server_port'])
@@ -493,7 +509,7 @@ class TCPRelayHandler(object):
     def _ota_chunk_data_gen(self, data):
         data_len = struct.pack(">H", len(data))
         index = struct.pack('>I', self._ota_chunk_idx)
-        key = self._encryptor.cipher_iv + index
+        key = self._cryptor.cipher_iv + index
         sha110 = onetimeauth_gen(data, key)
         self._ota_chunk_idx += 1
         return data_len + sha110 + data
@@ -502,7 +518,7 @@ class TCPRelayHandler(object):
         if self._is_local:
             if self._ota_enable:
                 data = self._ota_chunk_data_gen(data)
-            data = self._encryptor.encrypt(data)
+            data = self._cryptor.encrypt(data)
             self._write_to_sock(data, self._remote_sock)
         else:
             if self._ota_enable:
@@ -534,7 +550,7 @@ class TCPRelayHandler(object):
             return
         self._update_activity(len(data))
         if not is_local:
-            data = self._encryptor.decrypt(data)
+            data = self._cryptor.decrypt(data)
             if not data:
                 return
         if self._stage == STAGE_STREAM:
@@ -571,9 +587,9 @@ class TCPRelayHandler(object):
             return
         self._update_activity(len(data))
         if self._is_local:
-            data = self._encryptor.decrypt(data)
+            data = self._cryptor.decrypt(data)
         else:
-            data = self._encryptor.encrypt(data)
+            data = self._cryptor.encrypt(data)
         try:
             self._write_to_sock(data, self._local_sock)
         except Exception as e:
